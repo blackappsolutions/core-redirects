@@ -6,8 +6,9 @@
 
   <parent>
     <groupId>com.coremedia.blueprint</groupId>
-    <artifactId>core-redirects</artifactId>
+    <artifactId>content-feeder.extensions</artifactId>
     <version>1-SNAPSHOT</version>
+    <relativePath>../../../../apps/content-feeder/modules/extensions/pom.xml</relativePath>
   </parent>
 
   <artifactId>core-redirects-contentfeeder</artifactId>
