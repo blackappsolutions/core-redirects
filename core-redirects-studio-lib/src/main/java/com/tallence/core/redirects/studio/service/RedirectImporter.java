@@ -19,6 +19,9 @@ package com.tallence.core.redirects.studio.service;
 import com.coremedia.cap.common.IdHelper;
 import com.coremedia.cap.content.Content;
 import com.coremedia.cap.content.ContentRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tallence.core.redirects.helper.RedirectHelper;
+import com.tallence.core.redirects.model.RedirectSourceParameter;
 import com.tallence.core.redirects.studio.model.Redirect;
 import com.tallence.core.redirects.studio.model.RedirectUpdateProperties;
 import com.tallence.core.redirects.studio.repository.RedirectRepository;
@@ -33,7 +36,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -47,6 +52,7 @@ public class RedirectImporter {
   private static final String INVALID_CSV_ENTRY = "length_invalid";
   private static final String DUPLICATE_SOURCE = "duplicate_source";
   private static final String CREATION_FAILURE = "creation_failure";
+  private static final String PARSING_FAILURE = "parsing_failure";
 
   private final RedirectRepository redirectRepository;
   private final ContentRepository contentRepository;
@@ -72,20 +78,30 @@ public class RedirectImporter {
           .withFirstRecordAsHeader()
           .parse(new InputStreamReader(inputStream));
 
+      LOG.info("Csv file loaded. Starting to parse redirect csv entries.");
       Map<String, RedirectUpdateProperties> imports = new HashMap<>();
       for (CSVRecord record : records) {
         String csvEntry = getCsvEntry(record);
-        if (record.size() < 6) {
-          redirectImportResponse.addErrorMessage(csvEntry, INVALID_CSV_ENTRY);
+        if (record.size() < 7) {
+          addErrorMessage(redirectImportResponse, csvEntry, INVALID_CSV_ENTRY);
         } else {
           addIfNoDuplicate(siteId, redirectImportResponse, imports, record, csvEntry);
-
         }
       }
+      LOG.info("Parsed {} redirects. Starting to import redirects.", imports.keySet().size());
 
-      imports.forEach((csvEntry, properties) -> createRedirect(siteId, csvEntry, properties, redirectImportResponse));
-    } catch (IOException e) {
-      redirectImportResponse.addErrorMessage("", CREATION_FAILURE);
+      List<String> entries = new ArrayList<>(imports.keySet());
+      for (int i = 0; i < entries.size(); i++) {
+        if (i % 100 == 0) {
+          LOG.info("Processed {} redirects. {} entries left to be imported.", i, imports.size() - i);
+        }
+        String entry = entries.get(i);
+        createRedirect(siteId, entry, imports.get(entry), redirectImportResponse);
+      }
+
+      LOG.info("Finished redirect import. Imported {} redirects. Failed: {}.", redirectImportResponse.getCreated().size(), redirectImportResponse.getErrorMessages().size());
+    } catch (IOException | IllegalArgumentException e) {
+      addErrorMessage(redirectImportResponse, "", CREATION_FAILURE);
       LOG.error("Error while processing uploaded file", e);
     }
 
@@ -94,12 +110,20 @@ public class RedirectImporter {
 
   private void addIfNoDuplicate(String siteId, RedirectImportResponse redirectImportResponse, Map<String, RedirectUpdateProperties> imports, CSVRecord record, String csvEntry) {
     //Add to map, if no duplicate sourceUrl
-    RedirectUpdateProperties properties = mapToProperties(siteId, record);
-    if (imports.values().stream().noneMatch(p -> sourcesMatch(properties, p))) {
-      imports.put(csvEntry, properties);
-    } else {
-      redirectImportResponse.addErrorMessage(csvEntry, DUPLICATE_SOURCE);
+    try {
+      RedirectUpdateProperties properties = mapToProperties(siteId, record);
+      if (imports.values().stream().noneMatch(p -> sourcesMatch(properties, p))) {
+        imports.put(csvEntry, properties);
+      } else {
+        addErrorMessage(redirectImportResponse, csvEntry, DUPLICATE_SOURCE);
+      }
+    } catch (JsonProcessingException e) {
+      // could not parse source or target paramters
+      addErrorMessage(redirectImportResponse, csvEntry, PARSING_FAILURE);
     }
+
+
+
   }
 
   private boolean sourcesMatch(RedirectUpdateProperties value, RedirectUpdateProperties p) {
@@ -107,10 +131,16 @@ public class RedirectImporter {
     String source1 = Optional.ofNullable(p.getSource()).map(String::trim).orElse(null);
     String source2 = Optional.ofNullable(value.getSource()).map(String::trim).orElse(null);
 
-    return source1 != null && source1.equalsIgnoreCase(source2);
+
+    if (source1 != null && source1.equalsIgnoreCase(source2)) {
+      List<RedirectSourceParameter> sourceParameters1 = value.getSourceParameters();
+      List<RedirectSourceParameter> sourceParameters2 = p.getSourceParameters();
+      return sourceParameters1.size() == sourceParameters2.size() && sourceParameters2.containsAll(sourceParameters1);
+    }
+    return false;
   }
 
-  private RedirectUpdateProperties mapToProperties(String siteId, CSVRecord record) {
+  private RedirectUpdateProperties mapToProperties(String siteId, CSVRecord record) throws JsonProcessingException {
 
     Map<String, Object> properties = new HashMap<>();
 
@@ -126,10 +156,24 @@ public class RedirectImporter {
     Content targetLink = getTargetLink(record);
     properties.put(RedirectUpdateProperties.TARGET_LINK, targetLink);
 
-    String redirectType = record.get(4);
+    String targetUrl = record.get(4);
+    properties.put(RedirectUpdateProperties.TARGET_URL, targetUrl);
+
+    String redirectType = record.get(5);
     properties.put(RedirectUpdateProperties.REDIRECT_TYPE, redirectType);
 
-    properties.put(RedirectUpdateProperties.DESCRIPTION, record.get(5));
+    properties.put(RedirectUpdateProperties.DESCRIPTION, record.get(6));
+
+    Optional<String> sourceParams = Optional.ofNullable(record.get(7));
+    if (sourceParams.isPresent()) {
+      properties.put(RedirectUpdateProperties.SOURCE_PARAMETERS, RedirectHelper.parseRedirectSourceParameters(sourceParams.get()));
+    }
+
+    Optional<String> targetParams = Optional.ofNullable(record.get(8));
+    if (targetParams.isPresent()) {
+      properties.put(RedirectUpdateProperties.TARGET_PARAMETERS, RedirectHelper.parseRedirectTargetParameters(targetParams.get()));
+    }
+
     properties.put(RedirectUpdateProperties.IMPORTED, true);
 
     return new RedirectUpdateProperties(properties, redirectRepository, siteId, null);
@@ -152,10 +196,10 @@ public class RedirectImporter {
         Redirect redirect = redirectRepository.createRedirect(siteId, properties);
         response.addCreated(redirect);
       } catch (Exception e) {
-        response.addErrorMessage(csvEntry, CREATION_FAILURE);
+        addErrorMessage(response, csvEntry, PARSING_FAILURE);
       }
     } else {
-      errors.values().forEach(e -> response.addErrorMessage(csvEntry, e));
+      errors.values().forEach(errorCode -> addErrorMessage(response, csvEntry, errorCode));
     }
   }
 
@@ -193,5 +237,10 @@ public class RedirectImporter {
       entry.append(column);
     }
     return entry.toString();
+  }
+
+  private void addErrorMessage(RedirectImportResponse response, String csvEntry, String errorCode) {
+    LOG.warn("Could not import redirect for csv entry: {}, error code: {}.", csvEntry, errorCode);
+    response.addErrorMessage(csvEntry, errorCode);
   }
 }
